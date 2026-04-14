@@ -38,6 +38,7 @@ import {
 	getAudioDuration,
 	getAudioWaveform,
 	getRawMediaUploadData,
+	prepareStream,
 	type MediaDownloadOptions
 } from './messages-media'
 import { shouldIncludeReportingToken } from './reporting-utils'
@@ -176,28 +177,85 @@ export const prepareWAMessageMedia = async (
 	const isNewsletter = !!options.jid && isJidNewsletter(options.jid)
 	if (isNewsletter) {
 		logger?.info({ key: cacheableKey }, 'Preparing raw media for newsletter')
-		const { filePath, fileSha256, fileLength } = await getRawMediaUploadData(
+
+		const requiresThumbnailComputationNL =
+			(mediaType === 'image' || mediaType === 'video') && typeof uploadData['jpegThumbnail'] === 'undefined'
+		const requiresDurationComputationNL = mediaType === 'audio' && typeof uploadData.seconds === 'undefined'
+		const requiresWaveformProcessingNL =
+			mediaType === 'audio' && uploadData.ptt === true && typeof uploadData.waveform === 'undefined'
+		const requiresOriginalForNL = requiresThumbnailComputationNL || requiresDurationComputationNL
+
+		const { encWriteStream: rawBuffer, fileSha256, fileLength, bodyPath, didSaveToTmpPath } = await prepareStream(
 			uploadData.media,
 			options.mediaTypeOverride || mediaType,
-			logger
+			{
+				logger,
+				saveOriginalFileIfRequired: requiresOriginalForNL
+			}
 		)
 
 		const fileSha256B64 = fileSha256.toString('base64')
-		const { mediaUrl, directPath } = await options.upload(filePath, {
-			fileEncSha256B64: fileSha256B64,
-			mediaType: mediaType,
-			timeoutMs: options.mediaUploadTimeoutMs
+
+		const [uploadResult] = await Promise.all([
+			(async () => {
+				const result = await options.upload(rawBuffer as Buffer, {
+					fileEncSha256B64: fileSha256B64,
+					mediaType,
+					timeoutMs: options.mediaUploadTimeoutMs,
+					newsletter: true
+				})
+				logger?.debug({ mediaType, cacheableKey }, 'uploaded newsletter media')
+				return result
+			})(),
+			(async () => {
+				try {
+					if (requiresThumbnailComputationNL && bodyPath) {
+						const { thumbnail, originalImageDimensions } = await generateThumbnail(
+							bodyPath,
+							mediaType as 'image' | 'video',
+							options
+						)
+						uploadData.jpegThumbnail = thumbnail
+						if (!uploadData.width && originalImageDimensions) {
+							uploadData.width = originalImageDimensions.width
+							uploadData.height = originalImageDimensions.height
+						}
+						logger?.debug('generated newsletter thumbnail')
+					}
+
+					if (requiresDurationComputationNL && bodyPath) {
+						uploadData.seconds = await getAudioDuration(bodyPath)
+						logger?.debug('computed newsletter audio duration')
+					}
+
+					if (requiresWaveformProcessingNL) {
+						uploadData.waveform = await getAudioWaveform(bodyPath || (rawBuffer as Buffer), logger)
+						if (!uploadData.waveform) {
+							uploadData.waveform = new Uint8Array([0, 99, 0, 99, 0, 99, 0, 99])
+						}
+						logger?.debug('processed newsletter waveform')
+					}
+				} catch (error) {
+					logger?.warn({ trace: (error as any).stack }, 'failed to obtain extra info for newsletter media')
+				}
+			})()
+		]).finally(async () => {
+			if (didSaveToTmpPath && bodyPath) {
+				await fs.unlink(bodyPath).catch(() => {})
+			}
 		})
 
-		await fs.unlink(filePath)
+		const { mediaUrl, directPath, handle: uploadHandle } = uploadResult
 
 		const obj = WAProto.Message.fromObject({
-			// todo: add more support here
 			[`${mediaType}Message`]: (MessageTypeProto as any)[mediaType].fromObject({
-				url: mediaUrl,
+				// When server returns a handle, url & mediaKeyTimestamp are omitted
+				// (WhatsApp resolves them from the handle server-side)
+				url: uploadHandle ? undefined : mediaUrl,
 				directPath,
 				fileSha256,
 				fileLength,
+				mediaKeyTimestamp: uploadHandle ? undefined : unixTimestampSeconds(),
 				...uploadData,
 				media: undefined
 			})
@@ -210,6 +268,11 @@ export const prepareWAMessageMedia = async (
 
 		if (obj.stickerMessage) {
 			obj.stickerMessage.stickerSentTs = Date.now()
+		}
+
+		// Attach uploadHandle so relayMessage can set media_id attribute on the stanza
+		if (uploadHandle) {
+			;(obj as any)._uploadHandle = uploadHandle
 		}
 
 		if (cacheableKey) {
