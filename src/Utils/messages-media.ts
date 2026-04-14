@@ -663,6 +663,7 @@ const isNodeRuntime = (): boolean => {
 type MediaUploadResult = {
 	url?: string
 	direct_path?: string
+	handle?: string
 	meta_hmac?: string
 	ts?: number
 	fbid?: number
@@ -806,15 +807,65 @@ const uploadMedia = async (params: UploadParams, logger?: ILogger): Promise<Medi
 	}
 }
 
+/**
+ * Prepares a raw (unencrypted) media stream for newsletter upload.
+ * Newsletter media is uploaded without AES encryption — WhatsApp handles it server-side.
+ */
+type PrepareStreamOptions = {
+	logger?: ILogger
+	saveOriginalFileIfRequired?: boolean
+	opts?: RequestInit
+}
+
+export const prepareStream = async (
+	media: WAMediaUpload,
+	mediaType: MediaType,
+	{ logger, saveOriginalFileIfRequired }: PrepareStreamOptions = {}
+) => {
+	const { stream, type } = await getStream(media)
+
+	const chunks: Buffer[] = []
+	for await (const chunk of stream) {
+		chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+	}
+	const buffer = Buffer.concat(chunks)
+
+	const fileSha256 = Crypto.createHash('sha256').update(buffer).digest()
+	const fileLength = buffer.length
+
+	let bodyPath: string | undefined
+	let didSaveToTmpPath = false
+
+	if (type === 'file' && 'url' in media) {
+		bodyPath = media.url?.toString?.()
+	} else if (saveOriginalFileIfRequired) {
+		bodyPath = join(getTmpFilesDirectory(), mediaType + generateMessageIDV2())
+		await fs.writeFile(bodyPath, buffer)
+		didSaveToTmpPath = true
+	}
+
+	logger?.debug({ fileLength }, 'prepared raw stream for newsletter upload')
+
+	return {
+		mediaKey: undefined as undefined,
+		encWriteStream: buffer,
+		fileLength,
+		fileSha256,
+		fileEncSha256: undefined as undefined,
+		bodyPath,
+		didSaveToTmpPath
+	}
+}
+
 export const getWAUploadToServer = (
 	{ customUploadHosts, fetchAgent, logger, options }: SocketConfig,
 	refreshMediaConn: (force: boolean) => Promise<MediaConnInfo>
 ): WAMediaUploadFunction => {
-	return async (filePath, { mediaType, fileEncSha256B64, timeoutMs }) => {
+	return async (filePathOrBuffer, { mediaType, fileEncSha256B64, timeoutMs, newsletter }) => {
 		// send a query JSON to obtain the url & auth token to upload our media
 		let uploadInfo = await refreshMediaConn(false)
 
-		let urls: { mediaUrl: string; directPath: string; meta_hmac?: string; ts?: number; fbid?: number } | undefined
+		let urls: { mediaUrl: string; directPath: string; handle?: string; meta_hmac?: string; ts?: number; fbid?: number } | undefined
 		const hosts = [...customUploadHosts, ...uploadInfo.hosts]
 
 		fileEncSha256B64 = encodeBase64EncodedStringForUpload(fileEncSha256B64)
@@ -832,29 +883,59 @@ export const getWAUploadToServer = (
 			Origin: DEFAULT_ORIGIN
 		}
 
-		for (const { hostname } of hosts) {
-			logger.debug(`uploading to "${hostname}"`)
+		// Resolve the base media path, substituting newsletter path when needed
+		let mediaPath = MEDIA_PATH_MAP[mediaType]
+		if (newsletter) {
+			mediaPath = mediaPath?.replace('/mms/', '/newsletter/newsletter-')
+		}
+
+		for (const { hostname, maxContentLengthBytes } of hosts) {
+			logger.debug(`uploading to "${hostname}"${newsletter ? ' (newsletter)' : ''}`)
 
 			const auth = encodeURIComponent(uploadInfo.auth)
-			const url = `https://${hostname}${MEDIA_PATH_MAP[mediaType]}/${fileEncSha256B64}?auth=${auth}&token=${fileEncSha256B64}`
+			const url = `https://${hostname}${mediaPath}/${fileEncSha256B64}?auth=${auth}&token=${fileEncSha256B64}`
 
 			let result: MediaUploadResult | undefined
 			try {
-				result = await uploadMedia(
-					{
-						url,
-						filePath,
+				if (newsletter) {
+					// Newsletter: upload raw buffer directly (unencrypted)
+					let reqBuffer: Buffer
+					if (Buffer.isBuffer(filePathOrBuffer)) {
+						reqBuffer = filePathOrBuffer
+					} else {
+						reqBuffer = await fs.readFile(filePathOrBuffer as string)
+					}
+
+					const response = await fetch(url, {
+						method: 'POST',
+						body: reqBuffer,
 						headers,
-						timeoutMs,
-						agent: fetchAgent
-					},
-					logger
-				)
+						signal: timeoutMs ? AbortSignal.timeout(timeoutMs) : undefined
+					})
+					try {
+						result = (await response.json()) as MediaUploadResult
+					} catch {
+						result = undefined
+					}
+				} else {
+					// Regular: stream encrypted file
+					result = await uploadMedia(
+						{
+							url,
+							filePath: filePathOrBuffer as string,
+							headers,
+							timeoutMs,
+							agent: fetchAgent
+						},
+						logger
+					)
+				}
 
 				if (result?.url || result?.direct_path) {
 					urls = {
 						mediaUrl: result.url!,
 						directPath: result.direct_path!,
+						handle: result.handle,
 						meta_hmac: result.meta_hmac,
 						fbid: result.fbid,
 						ts: result.ts
