@@ -57,6 +57,9 @@ import {
 import { USyncQuery, USyncUser } from '../WAUSync'
 import { makeNewsletterSocket } from './newsletter'
 
+const _isNewsletterJid = (jid: string): boolean =>
+	typeof jid === 'string' && jid.endsWith('@newsletter')
+
 export const makeMessagesSocket = (config: SocketConfig) => {
 	const {
 		logger,
@@ -667,13 +670,89 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 			}
 
 			if (isNewsletter) {
+				// Handle edit
+				if (message.protocolMessage?.editedMessage) {
+					msgId = message.protocolMessage.key?.id!
+					message = message.protocolMessage.editedMessage
+				}
+
+				// Handle delete/revoke
+				if (message.protocolMessage?.type === proto.Message.ProtocolMessage.Type.REVOKE) {
+					msgId = message.protocolMessage.key?.id!
+					message = {}
+				}
+
+				// Convert listMessage → interactiveMessage for newsletter compatibility
+				if ((message as any).listMessage) {
+					const list = (message as any).listMessage
+					message = {
+						interactiveMessage: {
+							nativeFlowMessage: {
+								buttons: [{
+									name: 'single_select',
+									buttonParamsJson: JSON.stringify({
+										title: list.buttonText || 'Select',
+										sections: (list.sections || []).map((sec: any) => ({
+											title: sec.title || '',
+											highlight_label: '',
+											rows: (sec.rows || []).map((row: any) => ({
+												header: '',
+												title: row.title || '',
+												description: row.description || '',
+												id: row.rowId || row.id || ''
+											}))
+										}))
+									})
+								}],
+								messageParamsJson: '',
+								messageVersion: 1
+							},
+							body: { text: list.description || '' },
+							...(list.footerText ? { footer: { text: list.footerText } } : {}),
+							...(list.title ? { header: { title: list.title, hasMediaAttachment: false, subtitle: '' } } : {})
+						}
+					}
+				}
+				// Convert buttonsMessage → interactiveMessage for newsletter compatibility
+				else if ((message as any).buttonsMessage) {
+					const bMsg = (message as any).buttonsMessage
+					message = {
+						interactiveMessage: {
+							nativeFlowMessage: {
+								buttons: (bMsg.buttons || []).map((btn: any) => ({
+									name: 'quick_reply',
+									buttonParamsJson: JSON.stringify({
+										display_text: btn.buttonText?.displayText || btn.buttonText || '',
+										id: btn.buttonId || btn.buttonText?.displayText || ''
+									})
+								})),
+								messageParamsJson: '',
+								messageVersion: 1
+							},
+							body: { text: bMsg.contentText || bMsg.text || '' },
+							...(bMsg.footerText ? { footer: { text: bMsg.footerText } } : {})
+						}
+					}
+				}
+
 				const patched = patchMessageBeforeSending ? await patchMessageBeforeSending(message, []) : message
+				if (Array.isArray(patched)) {
+					throw new Error('Per-jid patching is not supported in newsletter')
+				}
+
 				const bytes = encodeNewsletterMessage(patched as proto.IMessage)
+
+				// Set mediatype for interactiveMessage if not already set by media
+				if ((patched as any).interactiveMessage && !extraAttrs['mediatype']) {
+					extraAttrs['mediatype'] = 'interactive'
+				}
+
 				binaryNodeContent.push({
 					tag: 'plaintext',
-					attrs: {},
+					attrs: extraAttrs,
 					content: bytes
 				})
+
 				const stanza: BinaryNode = {
 					tag: 'message',
 					attrs: {
@@ -684,7 +763,7 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 					},
 					content: binaryNodeContent
 				}
-				logger.debug({ msgId }, `sending newsletter message to ${jid}`)
+				logger.debug({ msgId, extraAttrs }, `sending newsletter message to ${jid}`)
 				await sendNode(stanza)
 				return
 			}
@@ -1219,6 +1298,7 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 						: disappearingMessagesInChat
 				await groupToggleEphemeral(jid, value)
 			} else {
+				let mediaHandle: string | undefined
 				const fullMsg = await generateWAMessage(jid, content, {
 					logger,
 					userJid,
@@ -1235,12 +1315,37 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 					//TODO: CACHE
 					getProfilePicUrl: sock.profilePictureUrl,
 					getCallLink: sock.createCallLink,
-					upload: waUploadToServer,
+					newsletter: _isNewsletterJid(jid),
+					upload: async (encFilePath, opts) => {
+						const up = await waUploadToServer(encFilePath, {
+							...opts,
+							newsletter: _isNewsletterJid(jid)
+						})
+						if (up.handle) mediaHandle = up.handle
+						return up
+					},
 					mediaCache: config.mediaCache,
 					options: config.options,
 					messageId: generateMessageIDV2(sock.user?.id),
 					...options
 				})
+
+				// Extract handle that was stored inside message object by prepareWAMessageMedia
+				if (!mediaHandle) {
+					const msgContent = fullMsg.message as any
+					const mediaTypes = [
+						'audioMessage', 'imageMessage', 'videoMessage',
+						'documentMessage', 'stickerMessage'
+					]
+					for (const t of mediaTypes) {
+						if (msgContent?.[t]?._uploadHandle) {
+							mediaHandle = msgContent[t]._uploadHandle
+							delete msgContent[t]._uploadHandle
+							break
+						}
+					}
+				}
+
 				const isEventMsg = 'event' in content && !!content.event
 				const isDeleteMsg = 'delete' in content && !!content.delete
 				const isEditMsg = 'edit' in content && !!content.edit
@@ -1274,6 +1379,11 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 							event_type: 'creation'
 						}
 					} as BinaryNode)
+				}
+
+				// Attach media_id handle for newsletter media uploads
+				if (mediaHandle) {
+					additionalAttributes['media_id'] = mediaHandle
 				}
 
 				await relayMessage(jid, fullMsg.message!, {
