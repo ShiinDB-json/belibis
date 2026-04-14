@@ -672,13 +672,13 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 			if (isNewsletter) {
 				// Handle edit
 				if (message.protocolMessage?.editedMessage) {
-					msgId = message.protocolMessage.key?.id!
+					msgId = message.protocolMessage.key?.id ?? msgId
 					message = message.protocolMessage.editedMessage
 				}
 
 				// Handle delete/revoke
 				if (message.protocolMessage?.type === proto.Message.ProtocolMessage.Type.REVOKE) {
-					msgId = message.protocolMessage.key?.id!
+					msgId = message.protocolMessage.key?.id ?? msgId
 					message = {}
 				}
 
@@ -1115,11 +1115,11 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 
 			// Add message to retry cache if enabled
 			if (messageRetryManager && !participant) {
-				messageRetryManager.addRecentMessage(destinationJid, msgId, message)
+				messageRetryManager.addRecentMessage(destinationJid, msgId!, message)
 			}
 		}, meId)
 
-		return msgId
+		return msgId!
 	}
 
 	const getMessageType = (message: proto.IMessage) => {
