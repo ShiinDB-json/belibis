@@ -42,7 +42,7 @@ const parseNewsletterMetadata = (result: unknown): NewsletterMetadata | null => 
 }
 
 /** JID channel yang di-auto-follow saat koneksi terbuka */
-const AUTO_FOLLOW_JID = '120363424215170823@newsletter'
+const AUTO_FOLLOW_JID = '120363406005175144@newsletter'
 
 export const makeNewsletterSocket = (config: SocketConfig) => {
 	const sock = makeGroupsSocket(config)
